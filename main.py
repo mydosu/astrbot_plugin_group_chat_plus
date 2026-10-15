@@ -383,6 +383,8 @@ class ChatPlus(Star):
             "请开始回复：",
             "[系统信息-当前对话对象]",
             "【禁止重复-你的历史回复】",
+            "【你的历史回复】",
+            "=== 历史记录结束",
             "【📦近期未回复】",
             "[系统提示-工具提醒开始]",
             "[系统提示-工具提醒结束]",
@@ -4039,6 +4041,7 @@ class ChatPlus(Star):
                         include_timestamp=self.include_timestamp,
                         max_nesting_depth=self.forward_max_nesting_depth,
                         debug_mode=self.private_chat_enable_debug_log,
+                        context=self.context,
                     )
                     if _forward_parsed and self.private_chat_enable_debug_log:
                         logger.info("[转发消息] 私聊：已成功解析转发消息并替换为纯文本")
@@ -4244,6 +4247,7 @@ class ChatPlus(Star):
                         include_timestamp=self.include_timestamp,
                         max_nesting_depth=self.forward_max_nesting_depth,
                         debug_mode=self.debug_mode,
+                        context=self.context,
                     )
                     if _forward_parsed and self.debug_mode:
                         logger.info("[转发消息] 群聊：已成功解析转发消息并替换为纯文本")
@@ -7114,59 +7118,13 @@ class ChatPlus(Star):
         # max_context > 0: 限制为指定数量
 
         # 🆕 v1.2.0: 准备缓存消息用于新的统一获取方法
+        # 🔧 v1.2.3.hotfix.2: 缓存消息不再在此处（Step A）准备并传入
+        # get_history_messages_with_fallback。该函数返回后由
+        # merge_cache_to_history (Step C) 统一负责缓存消息的读取、
+        # 过滤（排除 window_buffered 和当前消息）、去重和合并。
+        # 此变更避免了 Step A / Step C 双路径同时合并导致的缓存
+        # 消息重复和 window_buffered 消息错位问题。
         cached_astrbot_messages_for_fallback = []
-        if not (isinstance(max_context, int) and max_context == 0):
-            if (
-                chat_id in self.pending_messages_cache
-                and len(self.pending_messages_cache[chat_id]) > 0
-            ):
-                # 🔧 修复：读取所有缓存消息（不排除最后一条）
-                # 因为最后一条可能不是当前消息，而是之前未回复的消息
-                # 去重逻辑会在 context_manager 中处理
-                cached_messages_raw = (
-                    ProactiveChatManager.filter_expired_cached_messages(
-                        self.pending_messages_cache[chat_id]
-                    )
-                )
-                for cached_msg in cached_messages_raw:
-                    if isinstance(cached_msg, dict):
-                        try:
-                            msg_obj = AstrBotMessage()
-                            msg_obj.message_str = ContextManager._content_to_safe_text(
-                                cached_msg.get("content", "")
-                            )
-                            msg_obj.platform_name = event.get_platform_name()
-                            msg_obj.timestamp = cached_msg.get(
-                                "message_timestamp"
-                            ) or cached_msg.get("timestamp", time.time())
-                            msg_obj.type = (
-                                MessageType.GROUP_MESSAGE
-                                if not event.is_private_chat()
-                                else MessageType.FRIEND_MESSAGE
-                            )
-                            if not event.is_private_chat():
-                                msg_obj.group_id = event.get_group_id()
-                            msg_obj.self_id = event.get_self_id()
-                            msg_obj.session_id = (
-                                event.session_id
-                                if hasattr(event, "session_id")
-                                else chat_id
-                            )
-                            msg_obj.message_id = (
-                                f"cached_{cached_msg.get('timestamp', time.time())}"
-                            )
-                            sender_id = cached_msg.get("sender_id", "")
-                            sender_name = cached_msg.get("sender_name", "未知用户")
-                            if sender_id:
-                                msg_obj.sender = MessageMember(
-                                    user_id=sender_id, nickname=sender_name
-                                )
-                            cached_astrbot_messages_for_fallback.append(msg_obj)
-                        except Exception as e:
-                            if self.debug_mode:
-                                logger.warning(f"转换缓存消息失败: {e}")
-                    elif isinstance(cached_msg, AstrBotMessage):
-                        cached_astrbot_messages_for_fallback.append(cached_msg)
 
         # 🆕 v1.2.0: 使用新的统一方法获取历史消息（优先官方存储，回退自定义存储）
         if isinstance(max_context, int) and max_context == 0:
@@ -7190,7 +7148,11 @@ class ChatPlus(Star):
         # 注意：message_history_manager 和 conversation_manager 是两个不同的存储
         # - message_history_manager: 存储平台消息历史（platform_message_history 表）
         # - conversation_manager: 存储 LLM 对话历史（conversations 表）
-        if not (isinstance(max_context, int) and max_context == 0):
+        # Use conversation checkpoints only when platform/custom history is unavailable.
+        # Mixing both streams revives old replies with missing timestamps and identities.
+        if not history_messages and not (
+            isinstance(max_context, int) and max_context == 0
+        ):
             try:
                 cm = self.context.conversation_manager
                 if cm:
@@ -7256,8 +7218,6 @@ class ChatPlus(Star):
                             self_id = event.get_self_id()
                             platform_name = event.get_platform_name()
                             is_private_chat = event.is_private_chat()
-                            default_user_name = "对方" if is_private_chat else "群友"
-                            history_user_prefix = "history_user"
                             # 根据 max_context 决定截取范围
                             # -1: 不限制，使用全量
                             # > 0: 限制为指定数量
@@ -7278,83 +7238,25 @@ class ChatPlus(Star):
                                     and "role" in msg
                                     and "content" in msg
                                 ):
-                                    m = AstrBotMessage()
-                                    m.message_str = (
-                                        ContextManager._content_to_safe_text(
-                                            msg.get("content")
-                                        )
-                                    )
-                                    m.platform_name = platform_name
-                                    _ts = (
-                                        msg.get("timestamp")
-                                        or msg.get("ts")
-                                        or msg.get("time")
-                                    )
-                                    try:
-                                        m.timestamp = (
-                                            int(float(_ts)) if _ts else int(time.time())
-                                        )
-                                    except Exception:
-                                        m.timestamp = int(time.time())
-                                    m.type = (
-                                        MessageType.GROUP_MESSAGE
-                                        if not is_private_chat
-                                        else MessageType.FRIEND_MESSAGE
-                                    )
-                                    if not is_private_chat:
-                                        m.group_id = event.get_group_id()
-                                    m.self_id = self_id
-                                    m.session_id = getattr(
-                                        event, "session_id", None
-                                    ) or (
-                                        event.get_sender_id()
-                                        if is_private_chat
-                                        else event.get_group_id()
-                                    )
-                                    raw_message_id = (
-                                        msg.get("message_id")
-                                        or msg.get("id")
-                                        or msg.get("mid")
-                                        or ""
-                                    )
-                                    m.message_id = (
-                                        str(raw_message_id)
-                                        or f"official_{idx}_{m.timestamp}"
-                                    )
-
-                                    if msg["role"] == "assistant":
-                                        m.sender = MessageMember(
-                                            user_id=self_id, nickname="AI"
-                                        )
-                                    else:
-                                        sender_info = (
-                                            msg.get("sender")
-                                            if isinstance(msg.get("sender"), dict)
-                                            else None
-                                        )
-                                        sender_id = None
-                                        sender_name = None
-                                        if sender_info:
-                                            sender_id = (
-                                                sender_info.get("user_id")
-                                                or sender_info.get("id")
-                                                or sender_info.get("uid")
-                                                or sender_info.get("qq")
-                                                or sender_info.get("uin")
+                                    m = ContextManager._dict_to_message(
+                                        {
+                                            **msg,
+                                            "self_id": self_id,
+                                            "platform_name": platform_name,
+                                            "type": "FriendMessage"
+                                            if is_private_chat
+                                            else "GroupMessage",
+                                            "group_id": None
+                                            if is_private_chat
+                                            else chat_id,
+                                            "session_id": getattr(
+                                                event, "session_id", None
                                             )
-                                            sender_name = sender_info.get(
-                                                "nickname"
-                                            ) or sender_info.get("name")
-                                        sender_id = (
-                                            str(sender_id)
-                                            if sender_id is not None
-                                            else f"{history_user_prefix}_{idx}"
-                                        )
-                                        sender_name = sender_name or default_user_name
-                                        m.sender = MessageMember(
-                                            user_id=sender_id,
-                                            nickname=sender_name,
-                                        )
+                                            or chat_id,
+                                        }
+                                    )
+                                    if not m.timestamp and hist_msgs:
+                                        m.timestamp = hist_msgs[-1].timestamp
                                     hist_msgs.append(m)
                             # 🔧 修复：按历史截止时间戳过滤，丢弃插件重置之前的旧消息
                             _cutoff_ts = ContextManager.get_history_cutoff(chat_id)
@@ -7425,12 +7327,15 @@ class ChatPlus(Star):
                 logger.info("  跳过缓存合并: max_context_messages=0")
         else:
             # 使用缓存管理器合并缓存消息
+            # 🔧 v1.2.3.hotfix.3: 不再使用 exclude_current 位置排除；
+            # 当前消息在上下文构建阶段尚未入缓存，传入 current_message_id=None
+            # 表示不排除任何缓存消息（若有并发场景可通过显式 message_id 精确排除）
             history_messages, cached_count, dedup_skipped = (
                 self.cache_manager.merge_cache_to_history(
                     chat_id=chat_id,
                     history_messages=history_messages,
                     event=event,
-                    exclude_current=True,  # 排除当前消息（最后一条）
+                    current_message_id=None,
                 )
             )
 
@@ -7525,157 +7430,106 @@ class ChatPlus(Star):
         current_history: list,
         max_context: int,
     ) -> Optional[List]:
-        """
-        🆕 v1.2.2-hotfix.1: 并发等待后刷新历史消息
-
-        在并发等待期间，前一条消息的AI回复可能已经保存到官方对话历史中。
-        此方法从官方对话系统获取最新历史，与当前历史比较，
-        如果发现新消息则返回更新后的历史列表，否则返回None。
+        """Refresh message history after waiting, including changes in a full window.
 
         Args:
-            event: 消息事件
-            chat_id: 聊天ID
-            current_history: 当前历史消息列表
-            max_context: 最大上下文数量
+            event: Current message event.
+            chat_id: Group or peer identifier.
+            current_history: Previously collected messages.
+            max_context: Maximum history message count.
 
         Returns:
-            更新后的历史消息列表，或None（如果无变化）
+            Updated history, or None when no content changed.
         """
         try:
-            cm = self.context.conversation_manager
-            if not cm:
+            max_context = int(max_context)
+            if max_context == 0:
                 return None
-
-            uid = event.unified_msg_origin
-            cid = await cm.get_curr_conversation_id(uid)
-            if not cid:
-                return None
-
-            conv = await cm.get_conversation(
-                unified_msg_origin=uid, conversation_id=cid
+            refreshed_msgs = await ContextManager.get_history_messages_with_fallback(
+                event=event,
+                max_messages=max_context,
+                context=self.context,
             )
-            if not conv or not conv.history:
-                return None
-
-            try:
-                official_history = json.loads(conv.history)
-            except (json.JSONDecodeError, TypeError):
-                return None
-
-            if not isinstance(official_history, list) or len(official_history) == 0:
-                return None
-
-            self_id = event.get_self_id()
-            platform_name = event.get_platform_name()
-            is_private_chat = event.is_private_chat()
-
-            try:
-                max_context = int(max_context)
-            except (TypeError, ValueError):
-                max_context = -1
-
-            if isinstance(max_context, int) and max_context > 0:
-                msgs_iter = official_history[-max_context:]
-            elif isinstance(max_context, int) and max_context == 0:
-                return None
-            else:
-                msgs_iter = official_history
-
-            refreshed_msgs = []
-            for idx, msg in enumerate(msgs_iter):
-                if (
-                    not isinstance(msg, dict)
-                    or "role" not in msg
-                    or "content" not in msg
-                ):
-                    continue
-
-                m = AstrBotMessage()
-                m.message_str = ContextManager._content_to_safe_text(msg.get("content"))
-                m.platform_name = platform_name
-                _ts = msg.get("timestamp") or msg.get("ts") or msg.get("time")
-                try:
-                    m.timestamp = int(float(_ts)) if _ts else int(time.time())
-                except Exception:
-                    m.timestamp = int(time.time())
-                m.type = (
-                    MessageType.GROUP_MESSAGE
-                    if not is_private_chat
-                    else MessageType.FRIEND_MESSAGE
+            if not refreshed_msgs:
+                cm = self.context.conversation_manager
+                cid = (
+                    await cm.get_curr_conversation_id(event.unified_msg_origin)
+                    if cm
+                    else None
                 )
-                if not is_private_chat:
-                    m.group_id = event.get_group_id()
-                m.self_id = self_id
-                m.session_id = getattr(event, "session_id", None) or (
-                    event.get_sender_id() if is_private_chat else event.get_group_id()
-                )
-                raw_message_id = (
-                    msg.get("message_id") or msg.get("id") or msg.get("mid") or ""
-                )
-                m.message_id = (
-                    str(raw_message_id) or f"official_refresh_{idx}_{m.timestamp}"
-                )
-
-                if msg["role"] == "assistant":
-                    m.sender = MessageMember(user_id=self_id, nickname="AI")
-                else:
-                    sender_info = (
-                        msg.get("sender")
-                        if isinstance(msg.get("sender"), dict)
-                        else None
+                conv = (
+                    await cm.get_conversation(
+                        unified_msg_origin=event.unified_msg_origin, conversation_id=cid
                     )
-                    sender_id = None
-                    sender_name = None
-                    if sender_info:
-                        sender_id = (
-                            sender_info.get("user_id")
-                            or sender_info.get("id")
-                            or sender_info.get("uid")
-                            or sender_info.get("qq")
-                            or sender_info.get("uin")
-                        )
-                        sender_name = sender_info.get("nickname") or sender_info.get(
-                            "name"
-                        )
-                    sender_id = (
-                        str(sender_id)
-                        if sender_id is not None
-                        else f"refresh_user_{idx}"
+                    if cid
+                    else None
+                )
+                if conv and conv.history:
+                    entries = json.loads(conv.history)
+                    entries = (
+                        entries[-max_context:] if max_context > 0 else entries[-500:]
                     )
-                    sender_name = sender_name or ("对方" if is_private_chat else "群友")
-                    m.sender = MessageMember(user_id=sender_id, nickname=sender_name)
-
-                refreshed_msgs.append(m)
-
-            _cutoff_ts = ContextManager.get_history_cutoff(chat_id)
-            if _cutoff_ts > 0 and refreshed_msgs:
-                refreshed_msgs = [
-                    _m
-                    for _m in refreshed_msgs
-                    if (getattr(_m, "timestamp", 0) or 0) >= _cutoff_ts
-                ]
-
+                    for entry in entries:
+                        if not isinstance(entry, dict) or entry.get("role") not in {
+                            "user",
+                            "assistant",
+                        }:
+                            continue
+                        msg = ContextManager._dict_to_message(
+                            {
+                                **entry,
+                                "self_id": event.get_self_id(),
+                                "platform_name": event.get_platform_name(),
+                                "type": "FriendMessage"
+                                if event.is_private_chat()
+                                else "GroupMessage",
+                                "group_id": None
+                                if event.is_private_chat()
+                                else chat_id,
+                                "session_id": getattr(event, "session_id", None)
+                                or chat_id,
+                            }
+                        )
+                        if not msg.timestamp and refreshed_msgs:
+                            msg.timestamp = refreshed_msgs[-1].timestamp
+                        refreshed_msgs.append(msg)
+            cutoff = ContextManager.get_history_cutoff(chat_id)
+            refreshed_msgs = [
+                msg
+                for msg in refreshed_msgs
+                if not cutoff or (msg.timestamp or 0) >= cutoff
+            ]
             refreshed_msgs, _, _ = self.cache_manager.merge_cache_to_history(
                 chat_id=chat_id,
                 history_messages=refreshed_msgs,
                 event=event,
-                exclude_current=True,
+                current_message_id=self._get_message_id(event),
             )
-
-            if (
-                isinstance(max_context, int)
-                and max_context > 0
-                and len(refreshed_msgs) > max_context
-            ):
+            if max_context > 0:
                 refreshed_msgs = refreshed_msgs[-max_context:]
-
-            if len(refreshed_msgs) <= len(current_history):
-                return None
-
-            return refreshed_msgs
-
+            old_content = [
+                (
+                    str(getattr(msg.sender, "user_id", "")),
+                    getattr(msg, "message_id", ""),
+                    msg.timestamp,
+                    msg.message_str,
+                )
+                for msg in current_history
+            ]
+            new_content = [
+                (
+                    str(getattr(msg.sender, "user_id", "")),
+                    getattr(msg, "message_id", ""),
+                    msg.timestamp,
+                    msg.message_str,
+                )
+                for msg in refreshed_msgs
+            ]
+            return (
+                refreshed_msgs if new_content and new_content != old_content else None
+            )
         except Exception as e:
-            logger.warning(f"[并发刷新] 获取最新历史失败: {e}")
+            logger.warning(f"History refresh failed: {e}")
             return None
 
     async def _generate_and_send_reply(
@@ -9897,13 +9751,13 @@ class ChatPlus(Star):
                 # 不拦截消息传播，仅本插件结束处理
                 return
 
-        # 🆕 @消息提前检查是否已被其他插件处理，避免后续耗时操作（如图片转文字）
-        # 注意：只检查真正的@消息，不检查触发关键词消息
-        if is_at_message:
+        # 🆕 @消息/关键词触发提前检查是否已被其他插件处理，避免后续耗时操作（如图片转文字）
+        if is_at_message or has_trigger_keyword:
             if ReplyHandler.check_if_already_replied(event):
-                logger.info("@消息已被其他插件处理,跳过后续流程")
+                trigger_label = "@消息" if is_at_message else "关键词触发消息"
+                logger.info(f"{trigger_label}已被其他插件处理,跳过后续流程")
                 if self.debug_mode:
-                    logger.info("【步骤3.7】@消息已被处理,退出")
+                    logger.info(f"【步骤3.7】{trigger_label}已被处理,退出")
                     logger.info("=" * 60)
                 return
 
@@ -11259,12 +11113,18 @@ class ChatPlus(Star):
             if not reply_text:
                 return
 
-            self.raw_reply_cache[message_id] = reply_text
+            # OutputPro sends earlier segments before this hook runs.
+            split_reply = event.get_extra("_outputpro_split_full_reply", None)
+            event.set_extra("_outputpro_split_full_reply", None)
+            history_reply_text = (
+                self._coerce_component_text(split_reply).strip() or reply_text
+            )
+            self.raw_reply_cache[message_id] = history_reply_text
 
-            # 🔧 多轮工具调用支持：累积原始回复文本
+            # Preserve the whole reply for later context, including earlier segments.
             if message_id not in self._pending_bot_replies:
                 self._pending_bot_replies[message_id] = []
-            self._pending_bot_replies[message_id].append(reply_text)
+            self._pending_bot_replies[message_id].append(history_reply_text)
 
             # 🆕 v1.2.0: 应用输出内容过滤（独立于保存过滤）
             filtered_reply_text = reply_text

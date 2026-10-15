@@ -13,6 +13,10 @@
 """
 
 import asyncio
+import base64
+import io
+from pathlib import Path
+from PIL import Image as PILImage
 from typing import List, Optional, Tuple, Any
 from astrbot.api.all import *
 from astrbot.api.message_components import Face, At, AtAll, Reply
@@ -675,12 +679,27 @@ class ImageHandler:
                             )
                             continue
 
+                    # Validate downloaded files and normalize unsupported formats.
+                    vision_image = image_path
+                    if Path(image_path).is_file():
+                        with PILImage.open(image_path) as picture:
+                            picture.load()
+                            if picture.format not in {"JPEG", "PNG", "WEBP", "ICO"}:
+                                buffer = io.BytesIO()
+                                picture.convert("RGBA").save(buffer, format="PNG")
+                                vision_image = (
+                                    "data:image/png;base64,"
+                                    + base64.b64encode(buffer.getvalue()).decode(
+                                        "ascii"
+                                    )
+                                )
+
                     # 调用AI进行图片转文字,添加超时控制
                     async def call_vision_ai():
                         response = await provider.text_chat(
                             prompt=prompt,
                             contexts=[],
-                            image_urls=[image_path],
+                            image_urls=[vision_image],
                             func_tool=None,
                             system_prompt="",
                             session_id=session_id,

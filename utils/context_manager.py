@@ -21,7 +21,7 @@ import asyncio
 import json
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from ._session_guard import guard_session
 from .message_processor import MessageProcessor
 
@@ -333,7 +333,7 @@ class ContextManager:
         try:
             msg = AstrBotMessage()
             msg.message_str = ContextManager._content_to_safe_text(
-                msg_dict.get("message_str", "")
+                msg_dict.get("message_str", msg_dict.get("content", ""))
             )
             msg.platform_name = msg_dict.get("platform_name", "")
             msg.timestamp = msg_dict.get("timestamp", 0)
@@ -362,13 +362,32 @@ class ContextManager:
             msg.session_id = msg_dict.get("session_id", "")
             msg.message_id = msg_dict.get("message_id", "")
 
-            # 处理发送者信息
-            sender_dict = msg_dict.get("sender")
-            if sender_dict:
-                msg.sender = MessageMember(
-                    user_id=sender_dict.get("user_id", ""),
-                    nickname=sender_dict.get("nickname", ""),
-                )
+            # Recover metadata from legacy conversation entries without inventing identities.
+            sender_dict = msg_dict.get("sender") or {}
+            sender_id = sender_dict.get("user_id", "")
+            sender_name = sender_dict.get("nickname", "")
+            if msg_dict.get("role") == "assistant":
+                sender_id = msg.self_id
+                sender_name = sender_name or "AI"
+            prefix = re.match(
+                r"^\[(\d{4}-\d{2}-\d{2})\s+\S+\s+(\d{2}:\d{2}:\d{2})\]\s+(.+?)\(ID:([^\)\n]+)\)(?:\s*（[^\n]*?）)?\s*:\s*",
+                msg.message_str,
+            )
+            if prefix and (not sender_id or str(sender_id) == prefix.group(4)):
+                sender_id = prefix.group(4)
+                sender_name = sender_name or prefix.group(3)
+                try:
+                    msg.timestamp = int(
+                        datetime.strptime(
+                            prefix.group(1) + " " + prefix.group(2), "%Y-%m-%d %H:%M:%S"
+                        ).timestamp()
+                    )
+                    msg.message_str = msg.message_str[prefix.end() :]
+                except ValueError:
+                    pass
+            msg.sender = MessageMember(
+                user_id=sender_id or "unknown", nickname=sender_name or "未知用户"
+            )
 
             return msg
         except Exception as e:
@@ -376,7 +395,7 @@ class ContextManager:
             # 返回一个空的消息对象而不是 None，避免后续处理出错
             empty_msg = AstrBotMessage()
             empty_msg.message_str = ContextManager._content_to_safe_text(
-                msg_dict.get("message_str", "")
+                msg_dict.get("message_str", msg_dict.get("content", ""))
             )
             empty_msg.timestamp = 0
             return empty_msg
@@ -885,59 +904,47 @@ class ContextManager:
         chat_id: str,
         bot_id: str,
     ) -> Optional[AstrBotMessage]:
-        """
-        将官方 PlatformMessageHistory 对象转换为 AstrBotMessage
+        """Convert a platform history row while preserving UTC and sender metadata.
 
         Args:
-            history_item: 官方历史记录对象
-            platform_name: 平台名称
-            is_private: 是否私聊
-            chat_id: 聊天ID
-            bot_id: 机器人ID
+            history_item: Stored platform message.
+            platform_name: Platform name.
+            is_private: Whether the conversation is private.
+            chat_id: Group or peer identifier.
+            bot_id: Current bot identifier.
 
         Returns:
-            AstrBotMessage 对象，转换失败返回 None
+            Converted message, or None if conversion fails.
         """
         try:
-            msg = AstrBotMessage()
-
-            # 从 content 字段提取消息文本
-            content = history_item.content
-            message_text = ContextManager._content_to_safe_text(content)
-
-            msg.message_str = message_text
-            msg.platform_name = platform_name
-
-            # 处理时间戳
-            if hasattr(history_item, "created_at") and history_item.created_at:
-                if isinstance(history_item.created_at, datetime):
-                    msg.timestamp = int(history_item.created_at.timestamp())
-                else:
-                    msg.timestamp = 0
-            else:
-                msg.timestamp = 0
-
-            # 设置消息类型
-            msg.type = (
-                MessageType.FRIEND_MESSAGE if is_private else MessageType.GROUP_MESSAGE
+            created_at = getattr(history_item, "created_at", None)
+            timestamp = 0
+            if isinstance(created_at, datetime):
+                # SQLite stores the framework's UTC timestamps without tzinfo.
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                timestamp = int(created_at.timestamp())
+            return ContextManager._dict_to_message(
+                {
+                    "content": history_item.content,
+                    "platform_name": platform_name,
+                    "timestamp": timestamp,
+                    "type": "FriendMessage" if is_private else "GroupMessage",
+                    "group_id": None if is_private else chat_id,
+                    "sender": {
+                        "user_id": history_item.sender_id or "",
+                        "nickname": history_item.sender_name or "",
+                    },
+                    "self_id": bot_id,
+                    "session_id": chat_id,
+                    "message_id": f"official_{history_item.id}"
+                    if history_item.id
+                    else "",
+                }
             )
-
-            if not is_private:
-                msg.group_id = chat_id
-
-            # 设置发送者信息
-            sender_id = history_item.sender_id or ""
-            sender_name = history_item.sender_name or "未知用户"
-            msg.sender = MessageMember(user_id=sender_id, nickname=sender_name)
-            msg.self_id = bot_id
-            msg.session_id = chat_id
-            msg.message_id = f"official_{history_item.id}" if history_item.id else ""
-
-            return msg
-
         except Exception as e:
             if DEBUG_MODE:
-                logger.warning(f"转换官方历史记录失败: {e}")
+                logger.warning(f"Platform history conversion failed: {e}")
             return None
 
     @staticmethod
@@ -1426,17 +1433,20 @@ class ContextManager:
                     formatted_parts.append(
                         f"=== 历史消息上下文 ===\n"
                         f"[重要提示] 以下每条历史消息均已标注发送者的名字和用户ID（格式：名字(ID:用户ID): 消息内容）。\n"
-                        f"其中 ID 为 {bot_id} 的消息是【你自己之前发出的回复】（前缀标有「【禁止重复-你的历史回复】」），你已经说过这些话了，绝对不能再重复相同或相似的内容。\n"
+                        f"其中 ID 为 {bot_id} 的消息是【你自己之前发出的回复】（前缀标有「【你的历史回复】」），这些标记用于识别你说过的话；用户要求复述、澄清或确认时，可以重复必要事实，不要为了避重改变答案。\n"
                         f"其余 ID 的消息是【其他用户发送的消息】，是别人说的话，不是你说的。\n"
                         f"群聊中可能有多个不同用户的发言，请仔细识别每条消息的发送者 ID，准确区分是谁在说话，不要混淆。"
                     )
                 else:
                     formatted_parts.append(
                         "=== 历史消息上下文 ===\n"
-                        "[重要提示] 以下历史消息中，前缀标有「【禁止重复-你的历史回复】」的消息是【你自己之前发出的回复】，你已经说过这些话了，绝对不能再重复。\n"
+                        "[重要提示] 以下历史消息中，前缀标有「【你的历史回复】」的消息是【你自己之前发出的回复】，用户要求复述、澄清或确认时，可以重复必要事实，不要为了避重改变答案。\n"
                         "其余消息均为【其他用户发送的消息】，是别人说的话，不是你说的。请仔细区分。"
                     )
 
+                # Bound historical text separately from the current question.
+                history_parts = []
+                history_characters = 0
                 for msg in history_messages:
                     # 跳过无效的消息对象
                     if msg is None or not isinstance(msg, AstrBotMessage):
@@ -1517,7 +1527,7 @@ class ContextManager:
                         if is_bot:
                             # AI自己的回复，醒目标注防止重复
                             prefix_parts.append(
-                                f"【禁止重复-你的历史回复】{sender_name}(ID:{sender_id}):"
+                                f"【你的历史回复】{sender_name}(ID:{sender_id}):"
                             )
                         else:
                             # 其他用户的消息
@@ -1525,7 +1535,7 @@ class ContextManager:
                     else:
                         # 不包含发送者信息时，仍需要区分bot自己的消息
                         if is_bot:
-                            prefix_parts.append("【禁止重复-你的历史回复】:")
+                            prefix_parts.append("【你的历史回复】:")
 
                     # 组合完整消息
                     if prefix_parts:
@@ -1543,17 +1553,25 @@ class ContextManager:
                     if is_cached_msg:
                         formatted_msg = "【📦近期未回复】 " + formatted_msg
 
-                    formatted_parts.append(formatted_msg)
+                    if len(formatted_msg) > 4000:
+                        formatted_msg = (
+                            formatted_msg[:3000]
+                            + "\n[历史长消息中段已省略；需要全文时请用户重新引用]\n"
+                            + formatted_msg[-1000:]
+                        )
+                    history_parts.append(formatted_msg)
+                    history_characters += len(formatted_msg) + 1
+                    while history_characters > 24000 and len(history_parts) > 1:
+                        history_characters -= len(history_parts.pop(0)) + 1
 
+                formatted_parts.extend(history_parts)
                 formatted_parts.append("")  # 空行分隔
 
             # 添加当前消息部分（强调重要性）
             formatted_parts.append("")  # 空行分隔
             formatted_parts.append("")  # 额外空行，增强视觉隔离
             formatted_parts.append("=" * 60)
-            formatted_parts.append(
-                "=== 以上全部是历史消息，你已经处理过了，不要重复回答 ==="
-            )
+            formatted_parts.append("=== 历史记录结束；请结合这些记录理解当前消息 ===")
             formatted_parts.append(
                 "=== 【重要】以下是当前新消息（请优先关注这条消息的核心内容）==="
             )
@@ -1719,6 +1737,8 @@ class ContextManager:
                 or "紧接着又发的消息" in cleaned_message
                 or "=== 以上全部是历史消息" in cleaned_message
                 or "【禁止重复-你的历史回复】" in cleaned_message
+                or "【你的历史回复】" in cleaned_message
+                or "=== 历史记录结束" in cleaned_message
             ):  # 如果仍然包含系统提示，再次清理
                 import re
 
@@ -1824,7 +1844,7 @@ class ContextManager:
                 )
                 # 清理历史/当前消息分隔线（format_context_for_ai 输出的边界标记）
                 cleaned_message = re.sub(
-                    r"=+\n*=== 以上全部是历史消息，你已经处理过了，不要重复回答 ===\n*=+",
+                    r"=+\n*=== (?:以上全部是历史消息，你已经处理过了，不要重复回答|历史记录结束；请结合这些记录理解当前消息) ===\n*=+",
                     "",
                     cleaned_message,
                 )
@@ -1839,7 +1859,7 @@ class ContextManager:
                     cleaned_message,
                 )
                 cleaned_message = re.sub(
-                    r"【禁止重复-你的历史回复】",
+                    r"【(?:禁止重复-)?你的历史回复】",
                     "",
                     cleaned_message,
                 )
@@ -2053,6 +2073,8 @@ class ContextManager:
                 or "紧接着又发的消息" in cleaned_message
                 or "=== 以上全部是历史消息" in cleaned_message
                 or "【禁止重复-你的历史回复】" in cleaned_message
+                or "【你的历史回复】" in cleaned_message
+                or "=== 历史记录结束" in cleaned_message
             ):  # 如果仍然包含系统提示，再次清理
                 cleaned_message = re.sub(
                     r"\n+\s*\[系统提示\][^\n]*", "", cleaned_message
@@ -2156,7 +2178,7 @@ class ContextManager:
                 )
                 # 清理历史/当前消息分隔线（format_context_for_ai 输出的边界标记）
                 cleaned_message = re.sub(
-                    r"=+\n*=== 以上全部是历史消息，你已经处理过了，不要重复回答 ===\n*=+",
+                    r"=+\n*=== (?:以上全部是历史消息，你已经处理过了，不要重复回答|历史记录结束；请结合这些记录理解当前消息) ===\n*=+",
                     "",
                     cleaned_message,
                 )
@@ -2171,7 +2193,7 @@ class ContextManager:
                     cleaned_message,
                 )
                 cleaned_message = re.sub(
-                    r"【禁止重复-你的历史回复】",
+                    r"【(?:禁止重复-)?你的历史回复】",
                     "",
                     cleaned_message,
                 )
@@ -2264,11 +2286,24 @@ class ContextManager:
                     # 从event的result中获取消息链
                     result = event.get_result()
                     message_chain_dict = []
+                    full_text_saved = False
 
                     if result and hasattr(result, "chain") and result.chain:
                         # 转换消息链为dict格式，确保JSON可序列化
                         for comp in result.chain:
                             try:
+                                # Splitting may leave only the final segment in result.chain.
+                                # The supplied text contains the successfully sent full reply.
+                                if isinstance(comp, Plain) and bot_message_text:
+                                    if not full_text_saved:
+                                        message_chain_dict.append(
+                                            {
+                                                "type": "text",
+                                                "data": {"text": bot_message_text},
+                                            }
+                                        )
+                                        full_text_saved = True
+                                    continue
                                 comp_dict = await comp.to_dict()
                                 # 确保字典内容是JSON可序列化的
                                 if isinstance(comp_dict, dict):
@@ -2309,6 +2344,11 @@ class ContextManager:
                                 if DEBUG_MODE:
                                     logger.info(f"组件转换失败，跳过: {comp_err}")
                                     continue
+
+                    if bot_message_text and not full_text_saved:
+                        message_chain_dict.insert(
+                            0, {"type": "text", "data": {"text": bot_message_text}}
+                        )
 
                     if not message_chain_dict:
                         # 如果没有消息链，创建纯文本消息
@@ -2387,6 +2427,8 @@ class ContextManager:
                 or "[第三方插件补充信息]" in cleaned_message
                 or "=== 以上全部是历史消息" in cleaned_message
                 or "【禁止重复-你的历史回复】" in cleaned_message
+                or "【你的历史回复】" in cleaned_message
+                or "=== 历史记录结束" in cleaned_message
             ):
                 # 如果仍然包含系统提示，再次清理
                 import re
@@ -2440,7 +2482,7 @@ class ContextManager:
                 )
                 # 清理历史/当前消息分隔线
                 cleaned_message = re.sub(
-                    r"=+\n*=== 以上全部是历史消息，你已经处理过了，不要重复回答 ===\n*=+",
+                    r"=+\n*=== (?:以上全部是历史消息，你已经处理过了，不要重复回答|历史记录结束；请结合这些记录理解当前消息) ===\n*=+",
                     "",
                     cleaned_message,
                 )
@@ -2450,7 +2492,7 @@ class ContextManager:
                     cleaned_message,
                 )
                 cleaned_message = re.sub(
-                    r"【禁止重复-你的历史回复】",
+                    r"【(?:禁止重复-)?你的历史回复】",
                     "",
                     cleaned_message,
                 )

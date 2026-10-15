@@ -100,12 +100,10 @@ class ReplyHandler:
 - 用户语句缺主语时不要擅自补充，根据已有信息自然理解
 - 看到"你"不要立即认为是叫你，优先依据@信息、[系统信息-当前对话对象]提示和对话走向判断
 
-【严禁重复】必须检查：
-- 找出历史中属于你自己的回复（前缀标有"【禁止重复-你的历史回复】"的就是你之前说过的话）
-- 这些是你已经说过的内容，绝对不能再说一遍
-- 对比你要说的话是否与历史回复相同或相似
-- 相似度超过50%必须换完全不同的角度或表达方式
-- 绝对禁止重复相同句式、观点、回应模式
+【上下文承接与复述】：
+- 前缀标有"【你的历史回复】"的是你之前说过的话，可用于理解当前追问
+- 用户要求复述、澄清、确认或继续说明时，允许重复必要事实，保持人物、时间和内容一致
+- 优先回应当前问题，不要无缘无故重复旧话题；不得为了换表达而改变答案
 
 【记忆和背景信息】：
 - 不要机械陈述记忆内容（禁止"XXX已确认为我的XXX"等）
@@ -318,12 +316,26 @@ class ReplyHandler:
             # 这样AI服务商的前缀缓存（prefix caching）可以命中静态部分，降低调用成本。
             # 注意: 视频/文件路径已通过 enrich_media_markers 内联注入到 formatted_message
 
+            # 🆕 v1.2.3.hotfix.2: 构建对话对象再确认 + 反元兜底（追加在 prompt 末尾，
+            # 确保 AI 在读完所有历史/缓存/窗口缓冲消息后仍明确当前对话对象和输出要求）
+            _sender_tail = ""
+            if include_sender_info and sender_name:
+                _sender_tail = (
+                    f"\n\n[对话对象确认] 你正在和 {sender_name}（ID:{sender_id}）对话，"
+                    f"请围绕 ta 的话题回复，不要混淆历史中其他用户的发言。"
+                    f"历史中【📦近期未回复】标记的缓存消息也是完整对话的一部分"
+                    f"——特别是当前消息内容较少时（如仅@你、空消息），"
+                    f"需要主动结合这些缓存消息来理解对方的意图。"
+                    f"\n\n[最终要求] 直接输出你要说的那句话。"
+                    f"不要解释内部判断过程。对方要求原因、步骤或澄清时，直接说明实际内容，不要用反问代替回答。"
+                )
+
             if prompt_mode == "override" and extra_prompt and extra_prompt.strip():
                 # 覆盖模式：用户自定义提示词在前（静态），动态内容在后
                 # 🔧 v1.2.2-hotfix.1: sender_emphasis 提前到 formatted_message 之前，
                 # 让 AI 在阅读历史消息前就明确当前对话对象，避免被历史/窗口缓冲消息干扰
                 full_prompt = (
-                    extra_prompt.strip()
+                    "[请严格遵循 system prompt 中的指令进行回复]\n\n"
                     + sender_emphasis
                     + "\n\n"
                     + formatted_message
@@ -335,6 +347,7 @@ class ReplyHandler:
                     + fatigue_closing_prompt
                     + pending_reply_hint
                     + single_at_message_reply_hint
+                    + _sender_tail
                     + "\n\n---\n以上是消息上下文，请直接输出你的回复（不要无脑复读用户的消息，除非场景确实需要）"
                 )
                 if DEBUG_MODE:
@@ -358,6 +371,7 @@ class ReplyHandler:
                     + fatigue_closing_prompt
                     + pending_reply_hint
                     + single_at_message_reply_hint
+                    + _sender_tail
                     + "\n\n---\n以上是消息上下文，请直接输出你的回复（不要无脑复读用户的消息，除非场景确实需要）"
                 )
 
@@ -432,11 +446,13 @@ class ReplyHandler:
             except Exception as e:
                 logger.warning(f"获取人格设定失败: {e}，使用空人格")
 
-            # 如果有begin_dialogs，将其追加到prompt末尾（不破坏静态前缀缓存）
-            # 🔧 v1.2.2-hotfix.1: 从 prompt 开头移到末尾，使 SYSTEM_REPLY_PROMPT（静态指令）
-            # 保持在 prompt 最前面，提高前缀缓存命中概率
+            # Style demonstrations must not follow the current question.
             if begin_dialogs_text:
-                full_prompt += begin_dialogs_text
+                full_prompt = (
+                    "[以下仅为语气示范，不是当前对话；其中的人名、时间和事实不得套用到当前问题。]\n"
+                    + begin_dialogs_text
+                    + full_prompt
+                )
 
             # 🆕 v1.2.0: 改用 event.request_llm() 替代 provider.text_chat()
             # 这样可以让其他插件（如 emotionai）的 on_llm_request 钩子生效
@@ -458,11 +474,15 @@ class ReplyHandler:
             event.set_extra(PLUGIN_CUSTOM_PROMPT, full_prompt)
             # 🆕 v1.2.2-hotfix.1: 提取静态系统指令到独立 extra，由 on_llm_request 追加到 system_prompt
             # 注意: full_prompt 中保留原静态前缀以作安全网（钩子失败时仍可用）
-            _reply_static_instructions = ReplyHandler.SYSTEM_REPLY_PROMPT
-            if extra_prompt and extra_prompt.strip():
-                _reply_static_instructions += (
-                    f"\n\n用户补充说明:\n{extra_prompt.strip()}\n"
-                )
+            # Override must replace the defaults in the system hook too.
+            if prompt_mode == "override" and extra_prompt and extra_prompt.strip():
+                _reply_static_instructions = extra_prompt.strip()
+            else:
+                _reply_static_instructions = ReplyHandler.SYSTEM_REPLY_PROMPT
+                if extra_prompt and extra_prompt.strip():
+                    _reply_static_instructions += (
+                        f"\n\n用户补充说明:\n{extra_prompt.strip()}\n"
+                    )
             _reply_static_instructions += ReplyHandler.SYSTEM_REPLY_PROMPT_ENDING
             event.set_extra(
                 PLUGIN_CUSTOM_STATIC_INSTRUCTIONS, _reply_static_instructions
@@ -498,6 +518,60 @@ class ReplyHandler:
             #           其他插件（livigmemory 等，priority=0）先执行，此时 req.prompt
             #           是短的当前消息，向量检索正常工作。
             current_message_for_retrieval = event.get_message_str() or ""
+            # Elliptical corrections must retain the same speaker's actual task.
+            # Do not derive this link from another member or an assistant reply.
+            import re
+            import time
+
+            followup_source = None
+            correction = re.fullmatch(
+                r"[\s，,。.!！?？]*(?:我(?:是)?问你(?:呢|的)?|应该是你回答|"
+                r"你(?:来)?(?:回答|评价|说)|不是问我|你还没回答|"
+                r"我是让你(?:回答|评价)|继续(?:说)?|然后呢|你觉得呢)"
+                r"[\s，,。.!！?？啊呀呢吧]*(?:应该是你回答[啊呀呢吧]*)?[\s，,。.!！?？]*",
+                current_message_for_retrieval,
+            )
+            if correction:
+                for prior in reversed(history_messages[-20:]):
+                    prior_sender = getattr(prior, "sender", None)
+                    if str(getattr(prior_sender, "user_id", "")) != str(sender_id):
+                        continue
+                    prior_id = str(getattr(prior, "message_id", ""))
+                    if prior_id and prior_id == str(event.message_obj.message_id):
+                        continue
+                    prior_text = str(getattr(prior, "message_str", "") or "").strip()
+                    if (
+                        not prior_text
+                        or prior_text == current_message_for_retrieval.strip()
+                    ):
+                        continue
+                    prior_time = getattr(prior, "timestamp", None)
+                    if hasattr(prior_time, "timestamp"):
+                        prior_time = prior_time.timestamp()
+                    try:
+                        age = float(
+                            getattr(event.message_obj, "timestamp", time.time())
+                        ) - float(prior_time)
+                    except (TypeError, ValueError):
+                        break
+                    if not 0 <= age <= 600 or len(prior_text) > 400:
+                        break
+                    # Stop at the nearest substantive message; never mine old topics.
+                    if re.fullmatch(correction.re, prior_text):
+                        continue
+                    followup_source = {
+                        "sender_id": str(sender_id),
+                        "message_id": prior_id,
+                        "text": prior_text,
+                    }
+                    full_prompt += (
+                        "\n\n[本轮承接的原话]\n"
+                        f"{sender_name or sender_id} 前一条消息：{prior_text}\n"
+                        f"同一发送者本条追问：{current_message_for_retrieval}"
+                    )
+                    break
+            event.set_extra("_group_chat_plus_followup_source", followup_source)
+            event.set_extra(PLUGIN_CUSTOM_PROMPT, full_prompt)
             # 🔧 修复：单独无信息@消息时 get_message_str() 返回 ""，部分平台/框架收到空 prompt 会
             # 跳过 LLM 调用，导致 on_llm_request 钩子不触发、AI 无回复。
             # 用占位符替代空字符串；on_llm_request 钩子(-1优先级)会把 req.prompt 换回
@@ -547,7 +621,9 @@ class ReplyHandler:
         """
         检查消息是否已被其他插件处理
 
-        用于@消息兼容，避免重复回复
+        通过 _has_send_oper 标记判断，该标记在 event.send() 被调用后永久置为 True，
+        不受框架 clear_result() 影响（框架在 handler 之间会清除 event.result，
+        导致 get_result() 始终返回 None，因此不能依赖 get_result()）。
 
         Args:
             event: 消息事件
@@ -555,46 +631,4 @@ class ReplyHandler:
         Returns:
             True=已有回复，False=尚未回复
         """
-        try:
-            # 检查event的result字段
-            # 如果已经有result,说明已经被处理了
-            result = event.get_result()
-
-            if result is None:
-                return False
-
-            # AstrBot 会将字符串结果转换为 MessageEventResult
-            if isinstance(result, MessageEventResult):
-                has_stream = bool(getattr(result, "async_stream", None))
-                has_chain = bool(getattr(result, "chain", []) or [])
-                is_llm = bool(
-                    getattr(result, "is_llm_result", None) and result.is_llm_result()
-                )
-                is_stopped = bool(
-                    getattr(result, "result_type", None) == EventResultType.STOP
-                )
-                is_stream_state = bool(
-                    getattr(result, "result_content_type", None)
-                    in {
-                        ResultContentType.STREAMING_RESULT,
-                        ResultContentType.STREAMING_FINISH,
-                    }
-                )
-
-                if has_stream or has_chain or is_llm or is_stopped or is_stream_state:
-                    logger.info("检测到该消息已经被其他插件处理")
-                    return True
-
-                return False
-
-            # 未知类型的结果，保持向后兼容：只要非空视为已处理
-            if result:
-                logger.info("检测到该消息已经被其他插件处理")
-                return True
-
-            return False
-
-        except Exception as e:
-            logger.error(f"检查消息是否已回复时发生错误: {e}")
-            # 发生错误时,为安全起见,返回True避免重复回复
-            return True
+        return getattr(event, "_has_send_oper", False)
